@@ -1,0 +1,477 @@
+---
+title: "AIP-Group-Assignment"
+author: "Group 35"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggpubr)
+library(FSelector)
+library(e1071) #SVM
+library(scales)
+library(caTools)
+library(randomForest)
+library(ROSE)
+library(MASS)
+library(caret)
+library(pROC)
+library(VGAM) #tobit
+library(Hmisc)
+library(corrplot)
+options(warn = -1)
+```
+
+## Variable dictionary
+Attributes | Description
+--|---------
+  1) Customer_ID| customer identification number
+  2) recency| months since last purchase before the marketing campaign
+  3) purchase_segment| categorisation for the purchase amount (£) in the past year before the marketing campaign
+  4) purchase| actual purchase in the past year before the marketing campaign
+  5) mens| whether the customer purchased men's merchandise in the past year before the marketing campaign (1 = yes)
+  6) womens| whether the customer purchased women's merchandise in the past year before the marketing campaign (1 = yes)
+  7) zip_area| categorisation of zip code as Urban, Suburban, or Rural
+  8) new_customer| whether the customer is new in the past year or s/he is an existing customer (1 = yes)
+  9) channel| the channels the customer purchased from in the past year. The categories are Phone, Web and Multichannel 
+  10) email_segment| e-mail campaign the customer received, either for men's products or for women's products
+  11) age| age of the customer in years
+  12) dependent| whether the customer has a dependent or not (1 = yes)
+  13) account| whether the customer has an account or not (1 = yes)
+  14) employed| whether the customer has a permanant job (1 = yes)
+  15) phone| whether the customer registered his/her phone or not (1 = yes)
+  16) delivery| categorisation for the delivery address (1 = home; 2 = work; 3 = multiple)
+  17) marriage| marital status (1=married, 2=single, 0 = others)
+  18) payment_card| whether the customer registered a credit card for payment in the past year (1 = yes; 0 = no)
+  19) spend| total amount spent in the following two weeks period
+  20) visit| whether the customer visited the shop in the following two weeks period (1 = yes)
+
+  
+## Read the data
+Set Customer_ID as character variable; recency, purchase and spend as numeric variables; and other attributes as factor variables.
+```{r,warning=FALSE,message=FALSE}
+visit_data <- read.csv("/Users/wenke/Desktop/AIP Assignment Files/assignment_data.csv",stringsAsFactors = TRUE)
+str(visit_data)
+visit_data[,1] <- as.character(visit_data[,1])#int to character
+visit_data[,c(5,6,8,12:18,20)] <- lapply(visit_data[,c(5,6,8,12:18,20)],as.factor)#int to factor
+str(visit_data) #to check the structure of the data
+summary(visit_data) #to summarise the statistics of the data
+```
+
+
+## Data cleaning
+Since the features "account" (all customers have account == 1) and "Customer_ID" are redundant and does not affect customer's visit, we choose to remove them. "purchase_segment" contains duplicated information as "purchase", so we remove these two variables as well.
+```{r,warning=FALSE,message=FALSE}
+visit_data$account <- NULL
+visit_data$Customer_ID <- NULL
+visit_data$purchase_segment <- NULL
+```
+
+Considering the substantial amount of observations, we choose to delete the NA of spend. 
+```{r,warning=FALSE,message=FALSE}
+visit_data <- filter(visit_data, !is.na(spend))
+```
+
+## Exploratory analysis
+### Information Gain By Visit AND Spend
+Information gain measures the reduction in entropy by splitting a dataset according to a given value of a random variable. As shown in Figure 1, variables “marriage”, employed” and “dependent” have the lowest information gain both for “visit” and “spend”, which thus would be removed for model simplicity. In addition, variable “age” contains zero IG for "visit”, which will also be eliminated in modelling part.
+```{r,warning=FALSE,message=FALSE,fig.align="center"}
+#calculate the visit weights
+Visit_weights <- information.gain(visit~.,
+                                  subset(visit_data,select = -c(spend,email_segment))) %>%
+  arrange(desc(attr_importance)) %>%
+  filter(attr_importance>0)
+Visit_weights$attr_visit <- rownames(Visit_weights)
+Visit_weights
+#calculate the spend weights
+Spend_weights <- information.gain(spend~.,
+                                  subset(visit_data,select = -c(visit,email_segment))) %>%
+  arrange(desc(attr_importance)) %>%
+  filter(attr_importance>0)
+Spend_weights$attr_spend <- rownames(Spend_weights)
+Spend_weights
+#plot the weights
+par(mfrow=c(1,2),mar=c(10,3,2,3))
+barplot(Visit_weights$attr_importance, names =Visit_weights$attr_visit,las = 2,ylim = c(0, 0.06),
+        main = "Information gain calculated by Visit",cex.main=1,cex.axis=0.7,cex.names=0.7)
+barplot(Spend_weights$attr_importance, names =Spend_weights$attr_spend,las = 2,ylim = c(0, 0.06),
+        main = "Information gain calculated by Spend",cex.main=1,cex.axis=0.7,cex.names=0.7)
+```
+
+### Relationship between customer attributes and visit response after E-mail marketing
+Attributes: mens, womens, purchase, recency, zip_area, dilivery, channel, phone, new_customer, payment_card
+Dependent variable: Visit
+
+According to the overall grey shape of all graphs, the sample sizes and customer attributes of Mens E-Mail, Women E-Mail and No E-Mail groups are basically the same. **E-mails are randomly sent to customers** regardless of any attributes, 1/3 receive mens e-mail, 1/3 receive womens e-mail and 1/3 receive no e-mail.
+
+But according to the color composition of each set of graphs, we know that:
+
+- Who tend to visit after E-Mail marketing
+  **1. People who have a smaller recency and purchase amount between 500-1000 are affected most by the e-mail**, where the visit ratio of Mens E-Mail and Women E-Mail is obviously higher than No E-mail.
+  
+  2. New customers who deliver to work place and purchase on web are affected more by the e-mail, where the visit ratio of Mens E-Mail and Women E-Mail is moderately higher than No E-mail.
+  
+  3. People who live in rural areas, registered phone but didn't register credit card are possibly affected more by the e-mail, where the visit ratio of Mens E-Mail and Women E-Mail is slightly higher than No E-mail.
+
+- Difference between Mens E-Mail and Womens E-Mail
+  **2.1 customers who bought women's merchandise are more likely to visit after receiving the same gender e-mail**
+  2.2 higher purchase customers are more responsive to mens email compared to womens email.
+
+```{r,warning=FALSE,message=FALSE,fig.align="center"}
+#mens and womens
+ggarrange(
+ggplot(visit_data,aes(x=womens))+geom_bar(stat="count")+
+  facet_grid(email_segment~.)+scale_fill_brewer(palette = "Set2")+
+  labs(x="Whether purchased women's merchandise", y = "Count of customers")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+ggplot(visit_data,aes(x=mens))+geom_bar(stat="count")+
+  facet_grid(email_segment~.)+scale_fill_brewer(palette = "Set2")+
+  labs(x="Whether purchased men's merchandise", y = "")+
+  scale_fill_discrete(labels=c("No", "Yes")),nrow=1)
+
+ggarrange(
+ggplot(visit_data,aes(x=factor(womens, levels= c("0","1"), labels = c("No", "Yes")),fill=visit))+geom_bar(stat="count",position = "fill")+
+  facet_grid(email_segment~.)+
+  labs(x="Whether purchased women's merchandise", y = "Percentage of customers")+
+  scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+ggplot(visit_data,aes(x=factor(mens, levels= c("0","1"), labels = c("No", "Yes")),fill=visit))+geom_bar(stat="count",position = "fill")+
+  facet_grid(email_segment~.)+
+  labs(x="Whether purchased men's merchandise", y = "")
+  +
+  scale_fill_discrete(labels=c("No", "Yes")),nrow=1,common.legend=T)
+
+#purchase and recency
+ggarrange(
+ggplot(visit_data,aes(x=purchase,))+
+  geom_histogram(binwidth=10)+
+  facet_grid(.~email_segment)+labs(x="The purchase amount (£) in the past year before the marketing campaign", y = "Count of customers")+xlim(0,1500)+ylim(0,750),
+ggplot(visit_data,aes(x=recency))+
+  geom_histogram(binwidth=1)+
+  facet_grid(.~email_segment)+labs(x="Months since last purchase before the marketing campaign", y = "Count of customers")+xlim(0,13),nrow=2)
+
+ggarrange(
+ggplot(visit_data,aes(x=purchase,fill=visit))+
+  geom_histogram(binwidth=10,position = "fill")+
+  facet_grid(.~email_segment)+labs(x="The purchase amount (£) in the past year before the marketing campaign", y = "Percentage of customers")+xlim(0,1500)+scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+ggplot(visit_data,aes(x=recency,fill=visit))+
+  geom_histogram(binwidth=1,position = "fill")+
+  facet_grid(.~email_segment)+labs(x="Months since last purchase before the marketing campaign", y = "Percentage of customers")+xlim(1,13)+scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),nrow=2)
+
+#channel, zip_area, new_customer
+ggarrange(
+ggplot(visit_data,aes(x=factor(delivery, levels= c("1", "2", "3"), labels = c("Home","Work", "Multiple"))))+
+  geom_bar(stat="count")+facet_grid(email_segment~.)+
+  labs(x="The delivery address", y = "Count of customers"),
+ggplot(visit_data,aes(x=factor(channel, levels= c("Multichannel", "Phone", "Web"), labels = c("Multi","Phone", "Web"))))+
+  geom_bar(stat="count")+facet_grid(email_segment~.)+
+  labs(x="The purchasing channel", y = ""),
+ggplot(visit_data,aes(x=factor(new_customer, levels= c("0","1"), labels = c("No", "Yes"))))+
+  geom_bar(stat="count")+facet_grid(email_segment~.)+
+  labs(x="New customer", y = ""),
+nrow=1,common.legend=T)
+
+ggarrange(
+ggplot(visit_data,aes(x=factor(delivery, levels= c("1", "2", "3"), labels = c("Home","Work", "Multiple")),fill=visit))+
+  geom_bar(stat="count",position = "fill")+facet_grid(email_segment~.)+
+  labs(x="The delivery address", y = "Percentage of customers")+scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+ggplot(visit_data,aes(x=factor(channel, levels= c("Multichannel", "Phone", "Web"), labels = c("Multi","Phone", "Web")),fill=visit))+
+  geom_bar(stat="count",position = "fill")+facet_grid(email_segment~.)+
+  labs(x="The purchasing channel", y = "")+scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+ggplot(visit_data,aes(x=factor(zip_area, levels= c("Rural", "Surburban", "Urban"), labels = c("Rural","Surburb", "Urban")),fill=visit))+
+  geom_bar(stat="count",position = "fill")+facet_grid(email_segment~.)+
+  labs(x="The zip code area", y = "Percentage of customers")+scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+nrow=1,common.legend=T)
+
+
+#zip_area, phone, payment_card
+ggarrange(ggplot(visit_data,aes(x=factor(zip_area, levels= c("Rural", "Surburban", "Urban"), labels = c("Rural","Surburb", "Urban"))))+
+  geom_bar(stat="count")+facet_grid(email_segment~.)+
+  labs(x="The zip code area", y = ""),
+ggplot(visit_data,aes(x=factor(phone, levels= c("0","1"), labels = c("No", "Yes"))))+
+  geom_bar(stat="count")+facet_grid(email_segment~.)+
+  labs(x="Phone registered", y = ""),
+ggplot(visit_data,aes(x=factor(payment_card, levels= c("0","1"), labels = c("No", "Yes"))))+
+  geom_bar(stat="count")+facet_grid(email_segment~.)+
+  labs(x="Credit card registered", y = ""),
+nrow=1,common.legend=T)
+
+ggarrange(
+ggplot(visit_data,aes(x=factor(new_customer, levels= c("0","1"), labels = c("No", "Yes")),fill=visit))+
+  geom_bar(stat="count",position = "fill")+facet_grid(email_segment~.)+
+  labs(x="New customer", y = "")+scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+ggplot(visit_data,aes(x=factor(phone, levels= c("0","1"), labels = c("Not registered", "Registered")),fill=visit))+
+  geom_bar(stat="count",position = "fill")+facet_grid(email_segment~.)+
+  labs(x="Phone registered", y = "")+scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+ggplot(visit_data,aes(x=factor(payment_card, levels= c("0","1"), labels = c("Not registered", "Registered")),fill=visit))+
+  geom_bar(stat="count",position = "fill")+facet_grid(email_segment~.)+
+  labs(x="Credit card registered", y = "")+scale_fill_brewer(palette = "Set2")+
+  scale_fill_discrete(labels=c("No", "Yes")),
+nrow=1,common.legend=T)
+
+```
+
+  
+## Modelling step 1: four visit prediction models - decide who we send email to
+According to the evaluation results, Random Forest model with 6 attributes are most recommended.
+
+### Data preparation
+```{r}
+#data selection
+modeldata <- visit_data %>% filter(email_segment!="No E-Mail") %>% 
+  subset(select = -c(employed,marriage,dependent))
+#data partitioning
+set.seed(123) 
+partition = sample.split(modeldata$visit, SplitRatio = 0.7) 
+training_set = subset(modeldata, select = -c(spend,age,email_segment), partition == TRUE) 
+test_set = subset(modeldata, select = -c(spend,age,email_segment), partition == FALSE)
+#data balancing
+training_set <- ovun.sample(visit ~ ., data = training_set, method = "both", seed=1)$data
+```
+
+
+### Build 12 models
+```{r,warning=FALSE,message=FALSE,fig.align="center"}
+#Random Forest
+rf_1 <- randomForest(visit ~ recency+purchase+channel, training_set)
+rf_2 <- randomForest(visit ~ recency+purchase+channel+delivery+womens+new_customer, training_set,importance = T)
+rf_3 <- randomForest(visit ~ ., training_set)
+#Support Vector Machines
+svm_1 <- svm(visit ~ recency+purchase+channel, training_set, kernel = "radial", scale = TRUE,probability = TRUE)
+svm_2 <- svm(visit ~ recency+purchase+channel+delivery+womens+new_customer, training_set, kernel = "radial", scale = TRUE,probability = TRUE)
+svm_3 <- svm(visit ~ ., training_set, kernel = "radial", scale = TRUE,probability = TRUE)
+#Logistic Regression
+logistic_1 <- glm(visit ~ recency+purchase+channel, training_set, family = binomial(link = "logit"))
+logistic_2 <- glm(visit ~ recency+purchase+channel+delivery+womens+new_customer, training_set, family = binomial(link = "logit"))
+logistic_3 <- glm(visit ~ ., training_set, family = binomial(link = "logit"))
+#Linear Discriminant Analysis 
+lda_1 <- lda(visit~recency+purchase+channel, training_set)
+lda_2 <- lda(visit~recency+purchase+channel+delivery+womens+new_customer, training_set)
+lda_3 <- lda(visit~., training_set)
+```
+
+###prediction, accuracy and ROC
+```{r}
+#Prediction
+results <- as.data.frame(subset(test_set,select=c(visit)))
+results$rf_1 <- predict(rf_1,test_set)
+results$rf_2 <- predict(rf_2,test_set)
+results$rf_3 <- predict(rf_3,test_set)
+results$svm_1 <- predict(svm_1,test_set)
+results$svm_2 <- predict(svm_2,test_set)
+results$svm_3 <- predict(svm_3,test_set)
+results$logistic_1 <- ifelse(predict(logistic_1,test_set,type = "response")>0.5,1,0)
+results$logistic_2 <- ifelse(predict(logistic_2,test_set,type = "response")>0.5,1,0)
+results$logistic_3 <- ifelse(predict(logistic_3,test_set,type = "response")>0.5,1,0)
+results$lda_1 <- predict(lda_1,test_set)$class
+results$lda_2 <- predict(lda_2,test_set)$class
+results$lda_3 <- predict(lda_3,test_set)$class
+
+#Calculate accuracy
+model_evaluation <- data.frame(model=colnames(results[,-1]),accuracy="",auc="",precision="",recall="",F1="")
+for (n in 1:12){
+  model_evaluation[n,"accuracy"] <- scales::percent(length(which(results[ ,"visit"]==results[ ,n+1]))/length(results$visit),0.01)
+  TP <- length(filter(results,visit==1,results[,n+1]==1)$visit)
+  TN <- length(filter(results,visit==0,results[,n+1]==0)$visit)
+  FP <- length(filter(results,visit==0,results[,n+1]==1)$visit)
+  FN <- length(filter(results,visit==1,results[,n+1]==0)$visit)
+  model_evaluation[n,"precision"] <- scales::percent(TP/(TP+FP),0.01)
+  model_evaluation[n,"recall"] <- scales::percent(TP/(TP+FN),0.01)
+  model_evaluation[n,"F1"] <- scales::percent(2*TP/(2*TP+FP+FN),0.01)
+  }
+
+#Prediction probabilities
+results_prob <- as.data.frame(subset(test_set,select=c(visit)))
+results_prob$rf_1 <- predict(rf_1,test_set,type = "prob")[,"1"]
+results_prob$rf_2 <- predict(rf_2,test_set,type = "prob")[,"1"]
+results_prob$rf_3 <- predict(rf_3,test_set,type = "prob")[,"1"]
+results_prob$svm_1 <- attr(predict(svm_1,test_set,probability = T),"probabilities")[,"1"]
+results_prob$svm_2 <- attr(predict(svm_2,test_set,probability = T),"probabilities")[,"1"]
+results_prob$svm_3 <- attr(predict(svm_3,test_set,probability = T),"probabilities")[,"1"]
+results_prob$logistic_1 <- predict(logistic_1,test_set,type = "response")
+results_prob$logistic_2 <- predict(logistic_2,test_set,type = "response")
+results_prob$logistic_3 <- predict(logistic_3,test_set,type = "response")
+results_prob$lda_1 <- predict(lda_1,test_set)$posterior[,2]
+results_prob$lda_2 <- predict(lda_2,test_set)$posterior[,2]
+results_prob$lda_3 <- predict(lda_3,test_set)$posterior[,2]
+
+#Calculate AUC
+for (n in 1:12){
+  model_evaluation[n,"auc"] <- round(auc(roc(results_prob$visit,results_prob[,n+1])),2)}
+model_evaluation
+
+#Plot the ROC curve
+for (n in 2:13){
+  assign(c(paste0("ROC_",colnames(results_prob)))[n],roc(results_prob$visit,results_prob[,n]))
+}
+
+ggroc(list(ROC_rf_1,ROC_rf_2,ROC_rf_3,ROC_svm_1,ROC_svm_2,ROC_svm_3,ROC_logistic_1,ROC_logistic_2,ROC_logistic_3,ROC_lda_1,ROC_lda_2,ROC_lda_3), 
+      legacy.axes=TRUE) + 
+    xlab("FPR") + ylab("TPR") +
+    geom_abline(intercept = 0, slope = 1, 
+                color = "darkgrey", linetype = "dashed")
+
+ggarrange(
+  ggroc(list(three = ROC_rf_1,six = ROC_rf_2,ten = ROC_rf_3), 
+      legacy.axes=TRUE) + 
+    labs(x="FPR",y="TPR",subtitle = "Random Forest",color="Number of attributes")+
+    geom_abline(intercept = 0, slope = 1, 
+                color = "darkgrey", linetype = "dashed"),
+  ggroc(list(three = ROC_svm_1,six = ROC_svm_2,ten = ROC_svm_3), 
+      legacy.axes=TRUE) + 
+    labs(x="FPR",y="TPR",subtitle = "SVM",color="Number of attributes")+
+    geom_abline(intercept = 0, slope = 1, 
+                color = "darkgrey", linetype = "dashed"),
+  ggroc(list(three = ROC_logistic_1,six = ROC_logistic_2,ten = ROC_logistic_3), 
+      legacy.axes=TRUE) + 
+    labs(x="FPR",y="TPR",subtitle = "Logistic Regression",color="Number of attributes")+
+    geom_abline(intercept = 0, slope = 1, 
+                color = "darkgrey", linetype = "dashed"),
+  ggroc(list(three = ROC_lda_1,six = ROC_lda_2,ten = ROC_lda_3), 
+      legacy.axes=TRUE) + 
+    labs(x="FPR",y="TPR",subtitle = "LDA",color="Number of attributes")+
+    geom_abline(intercept = 0, slope = 1, 
+                color = "darkgrey", linetype = "dashed"),common.legend = T)
+
+#PLot the importance plot of rf_2 model
+varImpPlot(rf_2,main = "Variable importance as measured by the model suggested")
+```
+  
+## Modelling step 2: decide the kind of email we send - women or men
+different response of customers between women email marketing and men email marketing is only found among different merchandise group.
+Those only purchased women merchandises are more likely to response to women email, those only purchased men merchandises or both men and women merchandises are more likely to response to men email.
+
+```{r,warning=FALSE,message=FALSE,fig.align="center"}
+filter(visit_data, email_segment!='No E-Mail',mens!=0|womens!=0) %>%
+  group_by(mens,womens,email_segment) %>%
+  summarise(total=length(visit),visit_number=sum(visit==1),responce_rate=visit_number/total) %>%
+  mutate(category = ifelse(mens==0,"Womens only",ifelse(womens==0,"Mens only","Mens and Womens"))) %>%
+  ggplot(aes(x=category,y=responce_rate,fill=email_segment))+geom_bar(stat = "identity",position = "dodge")+labs(x="Merchandises purchased in the past year", y = " Visit rate after recieving E-mail")
+
+```
+
+## Modelling step 3: estimate the spend increase
+
+```{r,warning=FALSE,message=FALSE,fig.align="center"}
+# predict the spend of customers once they visit
+# no matter whether customer receive email or not, their "spend after visit" would adhere to the same Tobit model.
+# vglm(spend~., tobit(Lower = 0, Upper = Inf), data = visit_data %>% filter(visit==1) %>% 
+#        subset(select = -c(visit))) %>% summary()
+tobit <- vglm(spend~., tobit(Lower = 0, Upper = Inf), data = visit_data %>% filter(visit==1) %>% 
+  subset(select = -c(visit,email_segment,employed,marriage,dependent)))
+summary(tobit)
+
+
+email_number <- length(filter(visit_data,email_segment!="No E-Mail")$email_segment)
+
+####calculate the spend increase if we apply the decision model to all customers
+
+# apply models to whole dataset
+visit_data2 <- visit_data
+visit_data2$tobit_predicted_spend <- predict(tobit,visit_data2)
+visit_prob <- as.data.frame(subset(visit_data2,select=c(tobit_predicted_spend)))
+visit_prob$rf_1 <- predict(rf_1,visit_data,type = "prob")[,"1"]
+visit_prob$rf_2 <- predict(rf_2,visit_data,type = "prob")[,"1"]
+visit_prob$rf_3 <- predict(rf_3,visit_data,type = "prob")[,"1"]
+visit_prob$svm_1 <- attr(predict(svm_1,visit_data,probability = T),"probabilities")[,"1"]
+visit_prob$svm_2 <- attr(predict(svm_2,visit_data,probability = T),"probabilities")[,"1"]
+visit_prob$svm_3 <- attr(predict(svm_3,visit_data,probability = T),"probabilities")[,"1"]
+visit_prob$logistic_1 <- predict(logistic_1,visit_data,type = "response")
+visit_prob$logistic_2 <- predict(logistic_2,visit_data,type = "response")
+visit_prob$logistic_3 <- predict(logistic_3,visit_data,type = "response")
+visit_prob$lda_1 <- predict(lda_1,visit_data)$posterior[,2]
+visit_prob$lda_2 <- predict(lda_2,visit_data)$posterior[,2]
+visit_prob$lda_3 <- predict(lda_3,visit_data)$posterior[,2]
+
+
+
+
+#Predict average spend of marketing with different models, controlling the threshold to send the same amount of email as random marketing, email_number = 42732
+spend_increase <- data.frame(model=colnames(results[,-1]),sum_spend="",random_spend="",threshold_p="")
+for (n in 2:13){
+visit_prob <- arrange(visit_prob,desc(visit_prob[,n]))
+customer_selection <- visit_prob[1:email_number,]
+spend_increase$sum_spend[n-1] <-sum(customer_selection$tobit_predicted_spend*
+                                  customer_selection[,n])
+spend_increase$random_spend[n-1] <- mean(replicate(1000,
+                                     sum(sample(visit_prob$tobit_predicted_spend,size=email_number))*
+                                     visit_prob[,n]/email_number))
+spend_increase$threshold_p[n-1] <- customer_selection[email_number,n]
+}
+spend_increase$threshold_p <- as.numeric(spend_increase$threshold_p)
+spend_increase$sum_spend <- as.numeric(spend_increase$sum_spend)
+spend_increase$random_spend <- as.numeric(spend_increase$random_spend)
+
+spend_increase <- mutate(spend_increase,average_spend=sum_spend/email_number)
+spend_increase <- mutate(spend_increase,real_spend=sum(visit_data$spend)/email_number)
+spend_increase <- mutate(spend_increase,increase1=average_spend-random_spend)
+spend_increase <- mutate(spend_increase,increase2=average_spend-real_spend)
+spend_increase
+
+```
+
+```{r}
+#Predicted average spend of marketing using the best model with different thresholds
+prediction_spend <- data.frame(threshold_p="",email_percentage="",sum_spend="",average_spend="")
+i = 0
+for (p in seq(0.01,0.99,0.01)){
+  i = i+1
+  prediction_spend[i,1] <- p
+  customer_selection <- filter(visit_prob,visit_prob$rf_2>p)
+  prediction_spend[i,2] <- length(customer_selection$rf_2)/length(visit_prob$rf_2)
+  sum_spend <- sum(customer_selection$rf_2*customer_selection$tobit_predicted_spend)
+  average_spend <- sum(customer_selection$rf_2*customer_selection$tobit_predicted_spend)/
+                       length(customer_selection$tobit_predicted_spend)
+  prediction_spend[i,3] <- ifelse(sum_spend>0,sum_spend,NA)
+  
+  prediction_spend[i,4] <- ifelse(sum_spend>0,average_spend,NA)}
+prediction_spend
+
+#Plot average spend of marketing with different models and different thresholds
+prediction_spend$threshold_p <- as.numeric(prediction_spend$threshold_p)
+prediction_spend$sum_spend <- as.numeric(prediction_spend$sum_spend)
+prediction_spend$average_spend <- as.numeric(prediction_spend$average_spend)
+prediction_spend$email_percentage <- as.numeric(prediction_spend$email_percentage)
+
+ggarrange(
+ggplot(prediction_spend,aes(x=threshold_p,y=sum_spend))+geom_line()+
+  geom_vline(xintercept = 0.92, linetype = "dashed")+
+  geom_hline(yintercept = sum(visit_data$spend), linetype = "dashed")+
+  labs(x="",y="Total spend")+
+  annotate("text",x=0.3, y=1100000, label = 'Total spend of the last random marketing = 887502.2')+
+  annotate("text",x=0.96, y=1500000, label = 'p = 0.92'),
+
+ggplot(prediction_spend,aes(x=threshold_p,y=email_percentage))+geom_line()+
+  geom_vline(xintercept = 0.92, linetype = "dashed")+
+  geom_hline(yintercept = length(filter(visit_data,email_segment!="No E-Mail")$email_segment)/length(visit_data$email_segment), linetype = "dashed")+ 
+  geom_hline(yintercept = 0.15, linetype = "dashed")+
+  labs(x="",y="Received email")+
+  annotate("text",x=0.2, y=0.25, label = 'Percentage = 15%')+
+  annotate("text",x=0.5, y=0.8, label = '66.8% customers received E-mail in the last random marketing'),
+
+ggplot(prediction_spend,aes(x=threshold_p,y=average_spend))+geom_line()+
+  geom_vline(xintercept = 0.92, linetype = "dashed")+
+  geom_hline(yintercept = mean(filter(visit_data,spend!=0)$spend),linetype = "dashed")+
+  labs(x="Threshold probability",y="Average spend")+
+  annotate("text",x=0.2, y=100, label = 'Mean of spend(>0) = 88.36'),
+nrow = 3,common.legend =T,legend="right",align = "hv")
+```
+
+
+
+
+
+
+
+
+
